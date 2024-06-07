@@ -1,0 +1,1885 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Creates SQS Queues and Lambda functions that facilitate batch and streaming Crowdstrike Falcon Data Replicator ETL into the Amazon Security Lake
+Parameters:
+  CodeArtifactsBucketName:
+    Description: The name of the S3 bucket where QFDR_OCSF_Mapping.json, mapped_qfdr_events_to_class.json, and qopcfdr_stream_loader.py is uploaded. ENSURE THEY ARE AT THE TOP LEVEL!
+    Type: String
+  FdrBucketName:
+    Description: The name of the S3 bucket where Crowdstrike Falcon Data Replicator raw data is uploaded. ENSURE THAT EVENTBRIDGE EVENT PUBLISHING IS ENABLED FOR IT
+    Type: String
+  CrossAccountRoleArn:
+    Description: The Role ARN that Lambda will assume to publish batches of records to Kinesis Data Firehose
+    Type: String
+  CrossAccountRoleExtId:
+    Description: External ID for the Cross-Account Role that allows writing records into Kinesis Data Firehose
+    Type: String
+  LambdaSqsServiceRolePolicy:
+    Description: ARN of the AWSLambdaSQSQueueExecutionRole managed policy
+    Type: String
+    Default: arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+  SqsDelaySeconds:
+    Description: Amount of time to delay messages being visible in SQS
+    Type: Number
+    Default: 15
+  SqsVisibilityTimeout:
+    Description: The timeout duration in seconds of SQS queue visibility timeout, this value blocks other functions from working on a message in a given time period
+    Type: Number
+    Default: 300
+  LambdaTimeout:
+    Description: The timeout duration in seconds of Lambda functions
+    Type: Number
+    Default: 300
+  SqsLambdaBatchSize:
+    Description: The amount of maximum records between 10 and 10,000 to send to Lambda per invocation from sending to Kinesis Data Firehose. Be mindful of 2K EPS throttle limits and how many events can come through per second via SQS.
+    Type: Number
+    Default: 500
+  SqsMaxBatchingWindow:
+    Description: The maximum amount of time, in seconds, that Lambda spends gathering records before invoking the function. Set this to no more than half of the timeout.
+    Type: Number
+    Default: 120
+Resources:
+  ########################
+  # IAM ROLES & POLICIES #
+  ########################
+  # SQS>Lambda>STS>Firehose Lambda Role
+  LambdaFirehoseWriterAssumptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: query_open_pipeline_for_fdr_lambda_role
+      Description: Allows Lambda to read from QOPCFDR SQS Queue and assume a Cross-Account Role for writing to Kinesis Data Firehose - Managed by CloudFormation
+      ManagedPolicyArns: 
+        - !Ref LambdaSqsServiceRolePolicy
+      Policies:
+        - PolicyName: AssumeRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: firehoseWriterAssume
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Ref CrossAccountRoleArn
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  # Streaming S3>EB>SQS Lambda Role
+  LambdaSqsStreamingAssumptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: query_open_pipeline_for_fdr_streamer_role
+      Description: Allows Lambda to read from FDR and code artifact S3 bucket and write payloads to SQS - Managed by CloudFormation
+      ManagedPolicyArns: 
+        - !Ref LambdaSqsServiceRolePolicy
+      Policies:
+        - PolicyName: AssumeRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: sqsWriter
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:qopcfdr*'
+              - Effect: Allow
+                Sid: artifactBucketReader
+                Action:
+                  - s3:GetObjectAcl
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${CodeArtifactsBucketName}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${CodeArtifactsBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${FdrBucketName}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${FdrBucketName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  ######
+  # SQS #
+  #######
+  # Process Activity
+  ProcessActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_process_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_process_activity_queue
+        -
+          Key: OCSFClassName
+          Value: Process Activity
+  # Network Activity
+  NetworkActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_network_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_network_activity_queue
+        -
+          Key: OCSFClassName
+          Value: Network Activity
+  # Device Config State
+  DeviceConfigStateSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_device_config_state_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_device_config_state_queue
+        -
+          Key: OCSFClassName
+          Value: Device Config State
+  # HTTP Activity
+  HttpActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_http_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_http_activity_queue
+        -
+          Key: OCSFClassName
+          Value: HTTP Activity
+  # File System Activity
+  FileSystemActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_file_system_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_file_system_activity_queue
+        -
+          Key: OCSFClassName
+          Value: File System Activity
+  # DNS Activity
+  DnsActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_dns_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_dns_activity_queue
+        -
+          Key: OCSFClassName
+          Value: DNS Activity
+  # Authentication
+  AuthenticationSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_authentication_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_authentication_queue
+        -
+          Key: OCSFClassName
+          Value: Authentication
+  # File Hosting Activity
+  FileHostingActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_file_hosting_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_file_hosting_activity_queue
+        -
+          Key: OCSFClassName
+          Value: File Hosting Activity
+  # Module Activity
+  ModuleActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_module_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_module_activity_queue
+        -
+          Key: OCSFClassName
+          Value: Module Activity
+  # Application Lifecycle
+  ApplicationLifecycleSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_application_lifecycle_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_application_lifecycle_queue
+        -
+          Key: OCSFClassName
+          Value: Application Lifecycle
+  # Operating System Patch State
+  OperatingSystemPatchStateSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_operating_system_patch_state_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_operating_system_patch_state_queue
+        -
+          Key: OCSFClassName
+          Value: Operating System Patch State
+  # Detection Finding
+  DetectionFindingSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_detection_finding_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_detection_finding_queue
+        -
+          Key: OCSFClassName
+          Value: Detection Finding
+  # External API Activity (Crowdstrike event)
+  ExternalApiActivitySqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_extapi_http_activity_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 345600 # hard code for cfn-lint
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_extapi_http_activity_queue
+        -
+          Key: OCSFClassName
+          Value: HTTP Activity
+  # EB SQS Queue
+  EvBridgeEventsSqsQueue:
+    UpdateReplacePolicy: Retain
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: qopcfdr_eventbridge_s3_objects_queue
+      DelaySeconds: !Ref SqsDelaySeconds
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1200 # hard code for cfn-lint
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_eventbridge_s3_objects_queue
+  EvBridgeEventsSqsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: SQS:SendMessage
+            Resource: !GetAtt EvBridgeEventsSqsQueue.Arn
+      Queues:
+        - !Ref EvBridgeEventsSqsQueue
+  #########################################################
+  # LAMBDA, EVENT SOURCE MAPPING & INVOCAITON PERMISSIONS #
+  #########################################################
+  # Process Activity
+  ProcessActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_process_activity_processor
+      Description: Sends batches of Process Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_process_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_process_activity_processor
+        -
+          Key: OCSFClassName
+          Value: Process Activity
+  ProcessActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt ProcessActivitySqsQueue.Arn
+      FunctionName: !Ref ProcessActivityLambda
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Network Activity
+  NetworkActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_network_activity_processor
+      Description: Sends batches of Network Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_network_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_network_activity_processor
+        -
+          Key: OCSFClassName
+          Value: Network Activity
+  NetworkActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt NetworkActivitySqsQueue.Arn
+      FunctionName: !Ref NetworkActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Device Config State
+  DeviceConfigStateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_device_config_state_processor
+      Description: Sends batches of Device Config State normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_device_config_state_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_device_config_state_processor
+        -
+          Key: OCSFClassName
+          Value: Device Config State
+  DeviceConfigStateLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt DeviceConfigStateSqsQueue.Arn
+      FunctionName: !Ref DeviceConfigStateLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # HTTP Activity
+  HttpActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_http_activity_processor
+      Description: Sends batches of HTTP Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_http_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_http_activity_processor
+        -
+          Key: OCSFClassName
+          Value: HTTP Activity
+  HttpActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt HttpActivitySqsQueue.Arn
+      FunctionName: !Ref HttpActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # File System Activity
+  FileSystemActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_file_system_activity_processor
+      Description: Sends batches of File System Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_file_system_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_file_system_activity_processor
+        -
+          Key: OCSFClassName
+          Value: File System Activity
+  FileSystemActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt FileSystemActivitySqsQueue.Arn
+      FunctionName: !Ref FileSystemActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # DNS Activity
+  DnsActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_dns_activity_processor
+      Description: Sends batches of DNS Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_dns_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_dns_activity_processor
+        -
+          Key: OCSFClassName
+          Value: DNS Activity
+  DnsActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt DnsActivitySqsQueue.Arn
+      FunctionName: !Ref DnsActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Authentication
+  AuthenticationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_authentication_processor
+      Description: Sends batches of Authentication normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_authentication_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_authentication_processor
+        -
+          Key: OCSFClassName
+          Value: Authentication
+  AuthenticationLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt AuthenticationSqsQueue.Arn
+      FunctionName: !Ref AuthenticationLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # File Hosting Activity
+  FileHostingActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_file_hosting_activity_processor
+      Description: Sends batches of File Hosting Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_file_hosting_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_file_hosting_activity_processor
+        -
+          Key: OCSFClassName
+          Value: File Hosting Activity
+  FileHostingActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt FileHostingActivitySqsQueue.Arn
+      FunctionName: !Ref FileHostingActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Module Activity
+  ModuleActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_module_activity_processor
+      Description: Sends batches of Module Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_module_activity_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_module_activity_processor
+        -
+          Key: OCSFClassName
+          Value: Module Activity
+  ModuleActivityLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt ModuleActivitySqsQueue.Arn
+      FunctionName: !Ref ModuleActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Application Lifecycle
+  ApplicationLifecycleLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_application_lifecycle_processor
+      Description: Sends batches of Application Lifecycle normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_application_lifecycle_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_application_lifecycle_processor
+        -
+          Key: OCSFClassName
+          Value: Application Lifecycle
+  ApplicationLifecycleLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt ApplicationLifecycleSqsQueue.Arn
+      FunctionName: !Ref ApplicationLifecycleLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Operating System Patch State
+  OperatingSystemPatchStateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_operating_system_patch_state_processor
+      Description: Sends batches of Operating System Patch State normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_operating_system_patch_state_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_operating_system_patch_state_processor
+        -
+          Key: OCSFClassName
+          Value: Operating System Patch State
+  OperatingSystemPatchStateLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt OperatingSystemPatchStateSqsQueue.Arn
+      FunctionName: !Ref OperatingSystemPatchStateLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Detection Finding
+  DetectionFindingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_detection_finding_processor
+      Description: Sends batches of Detection Finding normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_detection_finding_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_detection_finding_processor
+        -
+          Key: OCSFClassName
+          Value: Detection Finding
+  DetectionFindingLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt DetectionFindingSqsQueue.Arn
+      FunctionName: !Ref DetectionFindingLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # External API Activity
+  ExternalApiActivityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_extapi_processor
+      Description: Sends batches of Crowdstrike external_apievent HTTP Activity normalized Crowdstrike FDR events from SQS to Data Firehose - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 1024
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaFirehoseWriterAssumptionRole.Arn
+      Environment:
+        Variables:
+          FIREHOSE_ROLE_ARN: !Ref CrossAccountRoleArn
+          FIREHOSE_ROLE_EXTERNAL_ID: !Ref CrossAccountRoleExtId
+          FIREHOSE_STREAM_NAME: qopcfdr_extapi_stream
+      Handler: index.lambdaHandler
+      Code:
+        ZipFile: |
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel("INFO")
+
+          from os import getenv
+
+          FIREHOSE_ROLE_ARN = getenv("FIREHOSE_ROLE_ARN")
+          FIREHOSE_ROLE_EXTERNAL_ID = getenv("FIREHOSE_ROLE_EXTERNAL_ID")
+          FIREHOSE_STREAM_NAME = getenv("FIREHOSE_STREAM_NAME")
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from sys import exit as sysexit
+          import json
+          from time import sleep
+
+          sts = boto3.client("sts")
+
+          def assumeIamRole():
+              """Wraps STS AssumeRole w/ External ID, returns temp creds for Boto3 Sessions"""
+              try:
+                  assumeRole = sts.assume_role(
+                      RoleArn=FIREHOSE_ROLE_ARN,
+                      RoleSessionName=f"qopcfdr_{FIREHOSE_STREAM_NAME}",
+                      ExternalId=FIREHOSE_ROLE_EXTERNAL_ID
+                  )
+
+                  logger.info("Successfully assumed IAM Role, returning temporary credentials")
+
+                  session = boto3.Session(
+                      aws_access_key_id=assumeRole["Credentials"]["AccessKeyId"],
+                      aws_secret_access_key=assumeRole["Credentials"]["SecretAccessKey"],
+                      aws_session_token=assumeRole["Credentials"]["SessionToken"],
+                      region_name=getenv("AWS_DEFAULT_REGION")
+                  )
+
+                  logger.info("Successfully created Boto3 Session for Firehose")
+
+                  return session.client("firehose")
+              except Exception as err:
+                  logger.error("Could not assume Role or create Boto3 session because: %s", err)
+                  sysexit(2)
+
+          FIREHOSE_CLIENT = assumeIamRole()
+
+          def lambdaHandler(event, context):        
+              sendToFirehose([json.loads(record["body"]) for record in event["Records"]])
+
+          def sendToFirehose(payloads: list[dict]):
+              """Sends a batch of records to firehose"""
+              firehoseRecords = [{'Data': json.dumps(record).encode()} for record in payloads]
+
+              try:
+                  r = FIREHOSE_CLIENT.put_record_batch(
+                      DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                      Records=firehoseRecords
+                  )
+                  fails = r["FailedPutCount"]
+
+                  if fails == 0:
+                      logger.info("Send batch of records to Firehose")
+                  else:
+                      while True:
+                          logger.info("Sleeping")
+                          sleep(3.5)
+                          r = FIREHOSE_CLIENT.put_record_batch(
+                              DeliveryStreamName=FIREHOSE_STREAM_NAME,
+                              Records=firehoseRecords
+                          )
+                          if r["FailedPutCount"] == 0:
+                              break
+                          else:
+                              continue
+              except ClientError as err:
+                  logger.error("Error sending records to Firehose: %s", err)
+                  sysexit(2)
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_extapi_processor
+        -
+          Key: OCSFClassName
+          Value: HTTP Activity
+  ExternalApiActivitySqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: !Ref SqsLambdaBatchSize
+      Enabled: true
+      EventSourceArn: !GetAtt ExternalApiActivitySqsQueue.Arn
+      FunctionName: !Ref ExternalApiActivityLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  # Streaming Lambda Function - LambdaSqsStreamingAssumptionRole
+  QopcfdrStreamingLambdaSqsMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt EvBridgeEventsSqsQueue.Arn
+      FunctionName: !Ref QopcfdrStreamingLambda 
+      MaximumBatchingWindowInSeconds: !Ref SqsMaxBatchingWindow
+  QopcfdrStreamingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: qopcfdr_stream_loader
+      Description: >- 
+        Downloads and parses raw Crowdstrike FDR data uploaded to an S3 bucket from a SQS queue via EventBridge and routes to SQS queues - Managed by CloudFormation
+      Runtime: python3.11
+      Architectures: 
+        - x86_64
+      MemorySize: 8192 # need to scale vCPU
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaSqsStreamingAssumptionRole.Arn
+      Environment:
+        Variables:
+          QOPCFDR_MAPPING_BUCKET: !Ref CodeArtifactsBucketName
+      Handler: qopcfdr_stream_loader.lambdaHandler
+      Code:
+        S3Bucket: !Ref CodeArtifactsBucketName
+        S3Key: qopcfdr_stream_loader.zip
+      Tags: 
+        -
+          Key: Name
+          Value: qopcfdr_stream_loader
+  ###############
+  # EVENTBRIDGE #
+  ###############
+  QopcfdrStreamEventBridgeRule: 
+    Type: AWS::Events::Rule
+    Properties:
+      Name: qopcfdr_fdr_upload_stream_trigger
+      Description: Sends async object creation keys to SQS for buffering - Managed by CloudFormation
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type: 
+          - Object Created
+        detail: 
+          bucket:
+            name:
+              - !Ref FdrBucketName
+          object:
+            key:
+              -
+                suffix: .gz
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt EvBridgeEventsSqsQueue.Arn
+          Id: qopcfdr_fdr_upload_stream_trigger
+###########
+# OUTPUTS #
+###########

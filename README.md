@@ -52,6 +52,8 @@ All services except for the Amazon Security Lake Custom Sources (and supporting 
 
 - You have Admin access to your data collection and Security Lake account and can interact with various APIs from Lake Formation, Glue, S3, IAM, Firehose, SQS, and more.
 
+- You understand limits around Kinesis Data Firehose and that ***you will be throttled*** if you attempt to replay 10TB worth of data.
+
 - **YOU DO NOT CHANGE ANY HARD CODED NAMES!** To streamline deployment, a lot of names are hardcoded to avoid complex interpolation logic or repeated manual data entry (such as giving the wrong Firehose or SQS Queue name to the wrong Lambda function).
 
 ## Known Limitations
@@ -134,8 +136,49 @@ You have completed setup in the Security Lake Account, now change to your Data C
 
 **NOTE**: It is recommended to create a new one if you are currently writing to a bucket that has `.gz` data written to it or uses a nested structure. This way you can safely copy existing FDR data and not risk transient failures from the QOPCFDR infrastructure being invoked for mismatched data.
 
-- Identify the bucket where you will copy/write FDR day into. Ensure the setting `Send notifications to Amazon EventBridge for all events in this bucket` is enabled.
+7. Upload [`QFDR_OCSF_Mapping.json`](./src/json/QFDR_OCSF_Mapping.json), [`mapped_qfdr_events_to_class.json`](./src/json/mapped_qfdr_events_to_class.json), [`qopcfdr_stream_loader.py`](./src/python/qopcfdr_stream_loader.py) (**ZIP THIS BEFORE UPLOADING!**) into another S3 bucket - or use the same Bucket. These are artifacts needed to create the streaming Lambda function and contain `base_event` normalizations and Crowdstrike FDR to OCSF Class mappings.
 
-- Upload `QFDR_OCSF_Mapping.json`, `mapped_qfdr_events_to_class.json`, and `qopcfdr_stream_loader.py` into a (separate) S3 bucket.
+```bash
+ARTIFACT_BUCKET_NAME="my_bucket_name"
+zip qopcfdr_stream_loader.zip src/python/qopcfdr_stream_loader.py
+aws s3 cp src/json/QFDR_OCSF_Mapping.json s3://${ARTIFACT_BUCKET_NAME}/QFDR_OCSF_Mapping.json
+aws s3 cp src/json/mapped_qfdr_events_to_class.json s3://${ARTIFACT_BUCKET_NAME}/mapped_qfdr_events_to_class.json
+aws s3 cp qopcfdr_stream_loader.zip s3://${ARTIFACT_BUCKET_NAME}/opcfdr_stream_loader.zip
+```
 
-- Deploy the `QOPCFDR_RealTimeCollection_CFN.yaml` Stack. This stack creates an EventBridge Rule, SQS Queues, Lambda functions, and IAM roles that facilitate the batching and queueing of FDR data from its raw form into the Security Lake.
+**NOTE**: In the future, as QOPCFDR expands mappings, you will need to re-upload these artifacts and redeploy the Stack from Step 1 to take advantage of new normalizaiton and mappings.
+
+8. Deploy the [`QOPCFDR_DataCollectionSupport_CFN.yaml`](./src/cfn_yaml/QOPCFDR_DataCollectionSupport_CFN.yaml) Stack. This stack creates an EventBridge Rule, SQS Queues, Lambda functions, and IAM roles that facilitate the batching and queueing of FDR data from its raw form into the Security Lake.
+
+You are now ready to begin streaming Falcon Data Replicator data into the Amazon Security Lake. 
+
+## Running the Solution & Cost Estimation
+
+To peform a basic benchmark, consider copying some existing FDR data into the bucket designated in Step 6 of the setup.
+
+Longer term, consider using a containerized ECS Service (or otherwise) that runs the Crowdstrike FDR script. By default it will long-poll the FDR SQS queue looking for new events. By keeping this middleware constantly running you can help ensure there will not be any throttling, dropped, or duplicate records written into the Security Lake.
+
+At a high-level here are some cost considerations using `us-east-2` (Ohio) as a comparison.
+- Firehose: $0.031/GB - this drops to $0.27/GB after the first 500TB/month.
+- Firehose JQ Processing: $0.07/Hour in total. In our testing ~600ms per 500 record batch was required.
+- Amazon S3 Storage: $23/TB/Month in Standard Availability (S3)
+- Amazon SQS: $0.40/1M Request for the first 100B Requests. These requests will come in the form of every FDR object uploaded and every FDR record written to the various Queues.
+- AWS Lambda Compute: $0.0000166667/GB-Seconds, this works out to $0.005/invocation that takes the full 300 seconds before timing out. Lambdas will process 500 records (or whatever you set your batch size to) per Queue.
+- AWS Lambda Requests: $0.20/1M Requests.
+
+If you are processing 50TB/month of FDR data, and if every TB has 10M records, an estimate cost would be ~$2775/Month before discounts and credits.
+- $1150 S3 cost for SA storage.
+- $1550 Firehose Costs + $12.60 for 120hrs of JQ processing.
+- $10 SQS costs - figuring 25M messages (each message is played twice, or more depending on long polling).
+- $5 Lambda Request costs - figuring 10M records.
+- $58 Lambda compute costs - figuring average 70 GB-seconds per Invocation at $0.00116 for that duration and 50000 invocations per month.
+
+There are harder cost facts to figure such as Glue, which charges $1/1M requests after the first 1M. There is also $1/100K objects recorded in the catalog after the first 1M objects. Athena charges are $5/TB scanned if you are using it to query your FDR data.
+
+## Providing new Mappings
+
+*coming soon* - we are working on a script that will create a differential of mapped data and provided samples that you can submit in an Issue.
+
+## License
+
+Licensed under Apache-2.0. See the license file [here](./LICENSE).

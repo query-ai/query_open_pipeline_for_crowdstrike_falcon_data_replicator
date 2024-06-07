@@ -1,0 +1,184 @@
+[
+  {
+    "ClassName": "Process Activity",
+    "MappedFdrEvents": [
+      "ProcessRollup2",
+      "EndOfProcess",
+      "ProcessRollup2Stats",
+      "TerminateProcess",
+      "SyntheticProcessRollup2",
+      "ProcessSelfDeleted",
+      "PtyCreated",
+      "TemplateDetectAnalysis",
+      "CreateProcessArgs"
+    ]
+  },
+  {
+    "ClassName": "Network Activity",
+    "MappedFdrEvents": [
+      "NetworkConnectIP4",
+      "NetworkReceiveAcceptIP4",
+      "NetworkListenIP4",
+      "RawBindIP6",
+      "NetworkConnectIP6",
+      "RawBindIP4",
+      "LocalIpAddressIP6",
+      "LocalIpAddressIP4",
+      "NetworkReceiveAcceptIP6",
+      "NetworkListenIP6"
+    ]
+  },
+  {
+    "ClassName": "Device Config State",
+    "MappedFdrEvents": [
+      "SensorTampering",
+      "SensorHeartbeat",
+      "NetworkLinkConfigGetLink",
+      "NetworkLinkConfigGetAddress",
+      "AgentConnect",
+      "ConfigStateUpdate",
+      "LocalIpAddressRemovedIP6",
+      "CurrentSystemTags",
+      "ResourceUtilization",
+      "NeighborListIP4",
+      "SensorProcessResourceUtilization",
+      "NeighborListIP6",
+      "ZeroTrustHostAssessment",
+      "LocalIpAddressRemovedIP4",
+      "SystemCapacity",
+      "OsVersionInfo",
+      "SpsTelemetryResponse",
+      "AdditionalHostInfo",
+      "HostInfo",
+      "DiskUtilization",
+      "AssociateIndicator",
+      "CriticalEnvironmentVariableChanged",
+      "InstanceMetadata",
+      "OciContainerTelemetry",
+      "SystemMeasurementStats",
+      "DiskCapacity",
+      "BillingInfo",
+      "HostnameChanged",
+      "ErrorEvent",
+      "SensorMetadataUpdate",
+      "AgentOnline",
+      "CreateSocket",
+      "PacketFilterAttached",
+      "AssociateTreeIdWithRoot",
+      "FileVaultStatus",
+      "FirewallEnabled",
+      "LoginItemAdded"
+    ]
+  },
+  {
+    "ClassName": "HTTP Activity",
+    "MappedFdrEvents": [
+      "HttpRequest",
+      "HttpResponse",
+      "TlsClientHello",
+      "Event_ExternalApiEvent"
+    ]
+  },
+  {
+    "ClassName": "File System Activity",
+    "MappedFdrEvents": [
+      "DirectoryCreate",
+      "CriticalFileAccessed",
+      "PngFileWritten",
+      "CrxFileWritten",
+      "JpegFileWritten",
+      "FsVolumeUnmounted",
+      "FsVolumeMounted",
+      "GzipFileWritten",
+      "NewScriptWritten",
+      "EmailFileWritten",
+      "PeFileWritten",
+      "AsepFileChangeScanInfo",
+      "ExecutableDeleted",
+      "MachOFileWritten",
+      "NewExecutableWritten",
+      "XarFileWritten",
+      "NewExecutableRenamed",
+      "GifFileWritten",
+      "ELFFileWritten",
+      "ScriptControlScanInfo",
+      "BZip2FileWritten",
+      "DmgFileWritten",
+      "ZipFileWritten",
+      "TarFileWritten",
+      "RtfFileWritten",
+      "DmpFileWritten",
+      "PdfFileWritten",
+      "TiffFileWritten",
+      "OoxmlFileWritten",
+      "SevenZipFileWritten",
+      "BmpFileWritten",
+      "JarFileWritten",
+      "MSXlsxFileWritten",
+      "OleFileWritten",
+      "FileOpenInfo",
+      "FileDeleteInfo",
+      "FileRenameInfo",
+      "CriticalFileModified",
+      "RpmFileWritten",
+      "MSDocxFileWritten",
+      "MSPptxFileWritten",
+      "DebFileWritten"
+    ]
+  },
+  {
+    "ClassName": "DNS Activity",
+    "MappedFdrEvents": [
+      "DnsRequest",
+      "SuspiciousDnsRequest"
+    ]
+  },
+  {
+    "ClassName": "Authentication",
+    "MappedFdrEvents": [
+      "UserIdentity",
+      "GroupIdentity",
+      "UserLogon",
+      "UserLogoff",
+      "UserLogonFailed2"
+    ]
+  },
+  {
+    "ClassName": "File Hosting Activity",
+    "MappedFdrEvents": [
+      "DeliverLocalFXToCloud",
+      "LFODownloadConfirmation",
+      "LfoUploadDataComplete",
+      "LfoUploadStart",
+      "LfoUploadDataUnneeded",
+      "LfoUploadDataFailed"
+    ]
+  },
+  {
+    "ClassName": "Module Activity",
+    "MappedFdrEvents": [
+      "ImageHash",
+      "IOServiceRegister",
+      "KextLoad",
+      "KextUnload"
+    ]
+  },
+  {
+    "ClassName": "Application Lifecycle",
+    "MappedFdrEvents": [
+      "InstalledApplication"
+    ]
+  },
+  {
+    "ClassName": "Operating System Patch State",
+    "MappedFdrEvents": [
+      "InstalledUpdates"
+    ]
+  },
+  {
+    "ClassName": "Detection Finding",
+    "MappedFdrEvents": [
+      "ScriptControlDetectInfo"
+    ]
+  }
+]
