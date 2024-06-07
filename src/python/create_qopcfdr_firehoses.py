@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser(description="Input AWS values")
 parser.add_argument(
     "--firehose_metadata_file_name",
     help="Name of the JSON metadata file that contains naming conventions for Firehose, Glue transformation tables, Custom Sources, and more.",
-    default="qopcfdr_firehose_metadata_template.json",
+    default="qopcfdr_firehose_metadata.json",
     type=str
 )
 parser.add_argument(

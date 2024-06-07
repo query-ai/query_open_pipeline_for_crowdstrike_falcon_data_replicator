@@ -38,20 +38,34 @@ All services except for the Amazon Security Lake Custom Sources (and supporting 
 
 ## Prequisites & Assumptions
 
-- DO NOT CHANGE ANY HARD CODED NAMES! To streamline deployment, a lot of names are hardcoded to avoid complex interpolation logic or repeated manual data entry (such as giving the wrong Firehose or SQS Queue name to the wrong Lambda function).
-- Crowdstrike Falcon Data Replicator is enabled in your tenant
-- You use Crowdstrike's Python script for writing FDR data to Amazon S3
-- You have Security Lake enabled in at least one Account and Region
-- You have a separate security data collection account from your Security Lake Delegated Administrator, while this solution *can* work, additional Lake Formation permissions issues may arise that have not been tested.
+- You have at least Python 3.10.4 and `pip3` (or your favored package manager) installed locally.
+
+- You have the AWS CLI configured on your local workstation, server, etc.
+
+- Crowdstrike Falcon Data Replicator is enabled in your tenant.
+
+- You use Crowdstrike's Python script for writing FDR data to Amazon S3.
+
+- You have Security Lake enabled in at least one Account and Region.
+
+- You have a separate security data collection account from your Security Lake Delegated Administrator, while this solution *can* work, additional Lake Formation permissions issues may arise that have not been tested..
+
 - You have Admin access to your data collection and Security Lake account and can interact with various APIs from Lake Formation, Glue, S3, IAM, Firehose, SQS, and more.
+
+- **YOU DO NOT CHANGE ANY HARD CODED NAMES!** To streamline deployment, a lot of names are hardcoded to avoid complex interpolation logic or repeated manual data entry (such as giving the wrong Firehose or SQS Queue name to the wrong Lambda function).
 
 ## Known Limitations
 
 - This is a Security Lake-only integration, in the future we may expand to other Lakehouses using open source data orchestration projects.
+
 - There is no utility to bulk-move previously saved FDR data. The best mechanism is to copy existing and future FDR dumps into a new bucket and key the automation off of it. In the future we are considering developing an EMR Notebook to utilize PySpark for petabyte scale mobility into the Security Lake.
+
 - Only 122 out of 950+ Falcon Data Replicator event types are supported due to the size and scope of our environment. Nearly every Windows events and mobile events are missing. Advanced licensing data is missing from FDR as well. Please see the **Expanding Coverage** section for more information on contributing mappings or providing us data.
+
 - Only the raw FDR events are normalized, other structured data from `aidmaster` and `manageddevice` is **NOT NORMALIZED NOR USED**.
+
 - Not every potential normalization is known, and the normalization is written against OCSF v1.2.0.
+
 - Simplistic exponential backoff built into Boto3 and Python is used for moving data between services - there can be times (depending on volume) where Firehose is throttled - Dead Letter Queues (DLQ) and more resilient retry logic will be developed at a later date.
 
 ## Deployment Steps
@@ -66,14 +80,59 @@ The following steps must take place in the AWS Account where Amazon Security Lak
 
 ![Step 2](./media/step2.png)
 
-3. Manually create Custom Sources using the Custom Source Name and Class Name detailed in [`qopcfdr_firehose_metadata_template.json`](./src/json/qopcfdr_firehose_metadata_template.json). As of 7 JUNE 2024 you will need to manually create 13
+3. Manually create Custom Sources using the Custom Source Name and Class Name detailed in [`qopcfdr_firehose_metadata.json`](./src/json/qopcfdr_firehose_metadata.json) as shown, and detailed, below. As of 7 JUNE 2024 you will need to manually create 13 Custom Sources.
 
-Ensure you add the full S3 URI (including `s3://` and the trailing `/`) into the JSON file. Use the ARN of the Crawler Role deployed by the CFN.
+    - Data source name: from `CustomSourceName`.
+    - OCSF Event class: from `ClassName`. Note that `Operating System Patch State` appears as `Patch State` in Security Lake.
+    - AWS Account ID: Enter your current account, this will create a dedicated IAM Role that allows s3:PutObject permissions. QOPCFDR uses Firehose so you can safely ignore these. *DO NOT DELETE THEM* or you will break Custom Sources.
+    - External ID: Enter anything here.
+    - Service Access: Select **Use an exisitng service role** and choose the Crawler Role deployed in Step 1. This will be named `query_open_pipeline_for_fdr_crawler_role`.
 
-- Execute the `create_qopcfdr_firehoses.py` script, providing an argument of the Firehose Role name and optionally the location of the metadata JSON if it is not in your current working directory. This will create Firehose Delivery Streams that use the deployed Glue tables and the IAM Role.
+![Step 3](./media/step3.png)
 
-### In the FDR Source Account
-(or Sec Lake Admin account if FDR raw data is stored there)
+4. Copy the the full S3 URI (including `s3://` and the trailing `/`) back into the JSON file as shown below. this file will be used by a script in the following steps that will create the Firehose Delivery Streams. This is also why we could not create the Firehose resources in the CloudFormation template.
+
+![Step 4](./media/step4.png)
+
+5. Run the `create_qopcfdr_firehoses.py` script, providing an argument of the Firehose Role name and optionally the location of the metadata JSON if it is not in your current working directory. This will create Firehose Delivery Streams that use the Glue tables and the IAM Role from the Stack deployed in Step 1.
+
+- 5A: You will require the following IAM Permissions
+
+```js
+logs:CreateLogGroup
+firehose:CreateDeliveryStream
+firehose:ListDeliveryStreams
+firehose:DeleteDeliveryStream
+```
+
+- 5B: Refer to the following commands to create a virtual environment, install necessary dependencies, and run the script.
+
+```bash
+# for macos
+export AWS_ACCOUNT_ID="your_account_id"
+brew install python3
+pip3 install virtualenv
+cd /Documents/GitHub/query_open_pipeline_for_crowdstrike_falcon_data_replicator
+virtualenv -p python3 .
+source ./bin/activate
+pip3 install boto3 --no-cache
+pip3 install argparse --no-cache
+python3 ./src/python/create_qopcfdr_firehoses.py --firehose_role_arn arn:aws:iam::${AWS_ACCOUNT_ID}:role/query_open_pipeline_for_fdr_firehose_role --firehose_metadata_file_name ./src/json/qopcfdr_firehose_metadata.json --deployment_mode create
+```
+
+To rollback the Firehose Delivery Streams, re-run the script without any arguments using `--deployment_mode delete`. It will keep the CloudWatch Log Group.
+
+You have completed setup in the Security Lake Account, now change to your Data Collection AWS account where Crowdstrike FDR data is written to complete the setup.
+
+### Prepare the the FDR Source Account
+
+**IMPORTANT NOTE**: This solution has not been tested within one Account, proceed at your own risk if you attempt to deploy the rest of the solution into the (Delegated) Administrator Security Lake Account.
+
+6. In the AWS Console navigate to **Services** -> **Storage** -> **S3**. In the S3 Console, create a bucket (or locate the existing one) for your Crowdstrike FDR data. In the **Properties** tab, scroll to the **Amazon EventBridge** section and enable the `Send notifications to Amazon EventBridge for all events in this bucket` option by using **Edit** as shown below.
+
+![Step 6](./media/step6.png)
+
+**NOTE**: It is recommended to create a new one if you are currently writing to a bucket that has `.gz` data written to it or uses a nested structure. This way you can safely copy existing FDR data and not risk transient failures from the QOPCFDR infrastructure being invoked for mismatched data.
 
 - Identify the bucket where you will copy/write FDR day into. Ensure the setting `Send notifications to Amazon EventBridge for all events in this bucket` is enabled.
 
