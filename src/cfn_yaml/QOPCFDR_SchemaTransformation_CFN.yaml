@@ -1,0 +1,1231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Deploys IAM Roles and AWS Glue tables that contain schema transformation data to transform Crowdstrike FDR JSON OCSF data into Parquet format. The Roles are used to create Amazon Security Lake Custom Sources, Amazon Kinesis Data Firehoses, and facilitate cross-account role assumption for Query Open Pipeline for Crowdstrike Falcon Data Replicator. DO NOT CHANGE ANY HARD-CODED NAMES IN THIS STACK!
+Parameters:
+  FdrSourceAccountId:
+    Description: The Account ID that will be publishing logs from Crowdstrike FDR - this can be the same account as your Security Lake Administrator Account if you store Crowdstrike Falcon Data Replicator in the same Account.
+    Type: String
+  FdrSourceExternalId:
+    Description: The External ID to use in the IAM Role assumed by the Account publishing logs from Crowdstrike FDR
+    Type: String
+    Default: bigchungus69420
+  GlueServiceRolePolicy:
+    Description: ARN of the Glue Service Role Managed Policy
+    Type: String
+    Default: arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+  SecLakeS3BucketName:
+    Description: Name of the Security Lake S3 Location from AWS Security Lake Custom Source location - ensure it is correct for your AWS Region
+    Type: String
+  SecLakeDatabaseName:
+    Description: Name of the Security Lake Glue Database for your Region. Ideally, use the database in your Security Lake Roll-up Region
+    Type: String
+Resources:
+  ########################
+  # IAM ROLES & POLICIES #
+  ########################
+  # Glue Crawler - Role
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: query_open_pipeline_for_fdr_crawler_role
+      Description: Grants AWS Glue Crawler access to Security Lake Custom Source directory in Amazon S3 - Managed by CloudFormation
+      ManagedPolicyArns: 
+        - !Ref GlueServiceRolePolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: seclakeCustomSources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${SecLakeS3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:RegisterResource
+                  - lakeformation:GrantPermissions
+                  - lakeformation:List*
+                  - lakeformation:GetDataAccess
+                  - lakeformation:Describe
+                Resource: "*"
+  # Firehose Delivery Stream - Role
+  FirehoseStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: query_open_pipeline_for_fdr_firehose_role
+      Description: Grants Data Firehose Delivery Streams permissions to read schema tables in AWS Glue, write and read from Sec Lake S3 bucket, and write CloudWatch Logs - Managed by CloudFormation
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: firehoseSeclakeCustomSources
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: glueschemaread
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersions
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/query_open_pipeline_for_fdr_firehose_etl_schemas'
+                  - !Sub 'arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/query_open_pipeline_for_fdr_firehose_etl_schemas/*'
+              - Effect: Allow
+                Sid: s3writerreader
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource: 
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SecLakeS3BucketName}/*'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SecLakeS3BucketName}'
+              - Effect: Allow
+                Sid: cwlogger
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*:*'
+  # FDR Cross-Account Firehose/Assumption - Role
+  CrossAccountFirehoseWriterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: query_open_pipeline_for_fdr_firehose_publisher_role
+      Description: !Sub 'Grants AWS Account ${FdrSourceAccountId} permission to write to Query Open Pipeline for Crowdstrike FDR related Data Firehose streams - Managed by CloudFormation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref FdrSourceAccountId
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: crossAccountFirehoseWriter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Sid: firehosewriter
+                Action:
+                  - firehose:PutR*
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/qopcfdr*'
+  #################
+  # LAKEFORMATION #
+  #################
+  # Glue Crawler - LakeFormation Permissions
+  GlueCrawlerLakeTablesPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueCrawlerRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref 'AWS::AccountId'
+          DatabaseName: !Ref SecLakeDatabaseName
+          TableWildcard: {}
+      Permissions:
+        - "ALTER"
+        - "DELETE"
+        - "DESCRIBE"
+        - "DROP"
+        - "INSERT"
+        - "SELECT"
+      PermissionsWithGrantOption:
+        - "ALTER"
+        - "DELETE"
+        - "DESCRIBE"
+        - "DROP"
+        - "INSERT"
+        - "SELECT"
+  # GlueCrawlerLakeDatabasesPermission:
+  #   Type: AWS::LakeFormation::PrincipalPermissions
+  #   Properties:
+  #     Principal:
+  #       DataLakePrincipalIdentifier: !GetAtt GlueCrawlerRole.Arn
+  #     Resource:
+  #       Database:
+  #         CatalogId: !Ref 'AWS::AccountId'
+  #         Name: !Ref SecLakeDatabaseName
+  #     Permissions:
+  #       - "CREATE_TABLE" 
+  #       - "ALTER" 
+  #       - "DESCRIBE"
+  #       - "DROP"
+  #     PermissionsWithGrantOption:
+  #       - "CREATE_TABLE" 
+  #       - "ALTER" 
+  #       - "DESCRIBE"
+  #       - "DROP"
+  GlueCrawlerDataLocationPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueCrawlerRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref 'AWS::AccountId'
+          ResourceArn: !Sub 'arn:${AWS::Partition}:s3:::${SecLakeS3BucketName}'
+      Permissions:
+        - "DATA_LOCATION_ACCESS" 
+      PermissionsWithGrantOption:
+        - "DATA_LOCATION_ACCESS" 
+  # Firehose Delivery Stream - LakeFormation Permissions
+  FirehoseLakeTablesPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseStreamRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref 'AWS::AccountId'
+          DatabaseName: !Ref SecLakeDatabaseName
+          TableWildcard: {}
+      Permissions:
+        - "ALL"
+      PermissionsWithGrantOption:
+        - "ALL"
+  FirehoseLakeDatabasesPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseStreamRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref 'AWS::AccountId'
+          Name: !Ref SecLakeDatabaseName
+      Permissions:
+        - "CREATE_TABLE" 
+        - "ALTER" 
+        - "DESCRIBE"
+      PermissionsWithGrantOption:
+        - "CREATE_TABLE" 
+        - "ALTER"
+        - "DESCRIBE"
+  # Firehose permissions for Transforms
+  FirehoseEtlTablesPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseStreamRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref 'AWS::AccountId'
+          DatabaseName: !Ref FirehoseSchemaGlueDatabase
+          TableWildcard: {}
+      Permissions:
+        - "ALL"
+      PermissionsWithGrantOption:
+        - "ALL"
+  FirehoseEtlDatabasesPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseStreamRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref 'AWS::AccountId'
+          Name: !Ref FirehoseSchemaGlueDatabase
+      Permissions:
+        - "CREATE_TABLE" 
+        - "ALTER" 
+        - "DESCRIBE"
+      PermissionsWithGrantOption:
+        - "CREATE_TABLE" 
+        - "ALTER"
+        - "DESCRIBE"
+  FirehoseDataLocationPermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseStreamRole.Arn
+      Resource:
+        DataLocation:
+          CatalogId: !Ref 'AWS::AccountId'
+          ResourceArn: !Sub 'arn:${AWS::Partition}:s3:::${SecLakeS3BucketName}'
+      Permissions:
+        - "DATA_LOCATION_ACCESS"
+      PermissionsWithGrantOption:
+        - "DATA_LOCATION_ACCESS" 
+  ########################
+  # AWS GLUE DB & TABLES #
+  ########################
+  FirehoseSchemaGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      DatabaseInput:
+        Description: Contains OCSF schema reference tables used by Firehose Delivery Streams to convert JSON into Parquet before writing to Security Lake for the Query Open Pipeline for Crowdstrike FDR solution - Created by CloudFormation
+        # if you change the name, ensure it's changed in the Firehose Delivery Stream role resource too
+        Name: query_open_pipeline_for_fdr_firehose_etl_schemas
+      CatalogId: !Ref AWS::AccountId
+  # Glue Table - Process Activity
+  OcsfEtlProcessActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_process_activity_schema
+        Description: Contains mapping for OCSF Process Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: struct<cmd_line:string,created_time:timestamp,pid:bigint,uid:string,file:struct<name:string,hashes:array<struct<algorithm_id:bigint,algorithm:string,value:string>>>,parent_process:struct<cmd_line:string,created_time:timestamp,uid:string,file:struct<name:string>>>
+              Name: process
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,process,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Network Activity
+  OcsfEtlNetworkActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_network_activity_schema
+        Description: Contains mapping for OCSF Network Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<direction:string,direction_id:bigint,uid:string,protocol_ver:string,protocol_ver_id:bigint>
+              Name: connection_info
+            - Type: struct<ip:string,uid:string,mac:string,intermediate_ips:array<string>,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: struct<ip:string,port:bigint>
+              Name: dst_endpoint
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,connection_info,src_endpoint,dst_endpoint,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Device Config State
+  OcsfEtlDeviceConfigStateGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_device_config_state_schema
+        Description: Contains mapping for OCSF Device Config State for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - HTTP Activity
+  OcsfEtlHttpActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_http_activity_schema
+        Description: Contains mapping for OCSF HTTP Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: status_code
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<process:struct<cmd_line:string>>
+              Name: actor
+            - Type: struct<name:string>
+              Name: file
+            - Type: struct<ip:string,port:bigint,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: struct<ip:string,port:bigint,domain:string>
+              Name: dst_endpoint
+            - Type: struct<http_method:string,uid:string,url:struct<hostname:string,path:string>>
+              Name: http_request
+            - Type: struct<version:string,ja3_hash:struct<algorithm:string,algorithm_id:bigint,value:string>>
+              Name: tls
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,status_code,type_name,type_uid,time,message,observables,metadata,actor,file,src_endpoint,dst_endpoint,http_request,tls,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - External API Activity
+  OcsfEtlExternalApiActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_external_api_schema
+        Description: Contains mapping for FDR External_APIActivity events into OCSF HTTP Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<http_method:string,user_agent:string,length:string,uid:string,http_headers:array<struct<name:string,value:string>>,url:struct<path:string>>
+              Name: http_request
+            - Type: struct<boundary_id:bigint,boundary:string,uid:string,direction_id:bigint,direction:string,protocol_ver_id:bigint,protocol_ver:string,protocol_name:string,protocol_num:bigint,session:struct<credential_uid:string>>
+              Name: connection_info
+            - Type: struct<ip:string,uid:string,owner:struct<uid:string,type_id:bigint,type:string,account:struct<uid:string,type_id:bigint,type:string>>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,http_request,connection_info,src_endpoint"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - File System Activity
+  OcsfEtlFileSystemActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_file_system_activity_schema
+        Description: Contains mapping for OCSF File System Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: struct<name:string,uid:string,path:string,type_id:bigint,type:string,confidentiality_id:bigint,confidentiality:string,creator:struct<name:string>,hashes:array<struct<algorithm_id:bigint,algorithm:string,value:string>>>
+              Name: file
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,file,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - DNS Activity
+  OcsfEtlDnsActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_dns_activity_schema
+        Description: Contains mapping for OCSF DNS Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: struct<opcode:string,opcode_id:bigint,hostname:string>
+              Name: query
+            - Type: bigint
+              Name: rcode_id
+            - Type: string
+              Name: rcode
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,src_endpoint,query,rcode_id,rcode,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Authentication
+  OcsfEtlAuthenticationGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_authentication_schema
+        Description: Contains mapping for OCSF Authentication for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: struct<pid:bigint>
+              Name: logon_process
+            - Type: struct<name:string,uid:string,uid_alt:string,type:string,type_id:bigint>
+              Name: user
+            - Type: struct<uid:string,uuid:string,uid_alt:string>
+              Name: session
+            - Type: string
+              Name: logon_type
+            - Type: bigint
+              Name: logon_type_id
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,src_endpoint,logon_process,user,session,logon_type,logon_type_id,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - File Hosting Activity
+  OcsfEtlFileHostingActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_file_hosting_activity_schema
+        Description: Contains mapping for OCSF File Hosting Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: src_endpoint
+            - Type: struct<hostname:string,port:bigint>
+              Name: dst_endpoint
+            - Type: struct<name:string,confidentiality_id:bigint,confidentiality:string,hashes:array<struct<algorithm_id:bigint,algorithm:string,value:string>>>
+              Name: file
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,src_endpoint,dst_endpoint,file,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Module Activity
+  OcsfEtlModuleActivityGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_module_activity_schema
+        Description: Contains mapping for OCSF Module Activity for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: struct<function_name:string,load_type_id:bigint,load_type:string,file:struct<name:string,hashes:array<struct<algorithm_id:bigint,algorithm:string,value:string>>>>
+              Name: module
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,module,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Application Lifecycle
+  OcsfEtlAppLifecycleGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_application_lifecycle_schema
+        Description: Contains mapping for OCSF Application Lifecycle for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: struct<name:string,uid:string,vendor_name:string,version:string>
+              Name: app
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,app,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Operating System Patch State
+  OcsfEtlOsPatchStateGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_operating_system_patch_state_schema
+        Description: Contains mapping for OCSF Operating System Patch State for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: array<struct<uid:string>>
+              Name: kb_article_list
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,kb_article_list,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+  # Glue Table - Detection Finding
+  OcsfEtlDetectionFindingGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref FirehoseSchemaGlueDatabase
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: query_open_pipeline_for_fdr_detection_finding_schema
+        Description: Contains mapping for OCSF Detection Finding for Kinesis Firehose conversion to Parquet - Managed by CloudFormation
+        TableType: EXTERNAL_TABLE
+        Parameters: {
+          "classification": "json",
+          "CrawlerSchemaDeserializerVersion": "1.0",
+          "CrawlerSchemaSerializerVersion": "1.0",
+          "averageRecordSize": "1465",
+          "compressionType": "none",
+          "objectCount": "1",
+          "recordCount": "2",
+          "sizeKey": "2930",
+          "typeOfData": "file"
+        }
+        StorageDescriptor:
+          Location: !Ref SecLakeS3BucketName
+          Columns:
+            - Type: bigint
+              Name: activity_id
+            - Type: string
+              Name: activity_name
+            - Type: string
+              Name: category_name
+            - Type: bigint
+              Name: category_uid
+            - Type: string
+              Name: class_name
+            - Type: bigint
+              Name: class_uid
+            - Type: string
+              Name: severity
+            - Type: bigint
+              Name: severity_id
+            - Type: string
+              Name: status
+            - Type: bigint
+              Name: status_id
+            - Type: string
+              Name: type_name
+            - Type: bigint
+              Name: type_uid
+            - Type: timestamp
+              Name: time
+            - Type: string
+              Name: message
+            - Type: array<struct<name:string,type:string,type_id:bigint,value:string>>
+              Name: observables
+            - Type: struct<uid:string,log_name:string,log_provider:string,version:string,profiles:array<string>,product:struct<lang:string,name:string,vendor_name:string,url_string:string>>
+              Name: metadata
+            - Type: struct<ip:string,uid:string,os:struct<type_id:bigint,type:string>,agent_list:array<struct<uid:string,name:string,version:string,type_id:bigint,type:string,vendor_name:string>>>
+              Name: device
+            - Type: array<struct<process:struct<cmd_line:string,uid:string,file:struct<name:string,hashes:array<struct<algorithm:string,algorithm_id:bigint,value:string>>>parent_process:struct<cmd_line:string,file:struct<name:string>,parent_process:strut<cmd_line:string,file:struct<name:string>>>>>>
+              Name: evidences
+            - Type: map<string,string>
+              Name: unmapped
+            - Type: string
+              Name: partition_0
+          SerdeInfo:
+            Parameters: {
+              "field.delim": ",",
+              "paths": "activity_name,activity_id,category_name,category_uid,class_name,class_uid,severity,severity_id,status,status_id,type_name,type_uid,time,message,observables,metadata,device,evidences,unmapped"
+            }
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+
+  ###########
+  # OUTPUTS #
+  ###########
+Outputs:
+  GlueCrawlerRoleArnOutput:
+    Description: ARN of the IAM Role used for AWS Glue Crawler for Security Lake custom sources - used to register custom sources
+    Value: !GetAtt GlueCrawlerRole.Arn
+  FirehoseStreamRoleArnOutput:
+    Description: ARN of the IAM Role used for Firehose
+    Value: !GetAtt FirehoseStreamRole.Arn
+  CrossAccountFirehoseWriteArnOutput:
+    Description: ARN of the IAM Role that is assumed and has permissions to write records to Firehose
+    Value: !GetAtt CrossAccountFirehoseWriterRole.Arn
+  FdrSourceExternalIdOutput:
+    Description: The External ID specified in the Parameters used to prevent the Confused Deputy problem with cross-account role assumption.
+    Value: !Ref FdrSourceExternalId

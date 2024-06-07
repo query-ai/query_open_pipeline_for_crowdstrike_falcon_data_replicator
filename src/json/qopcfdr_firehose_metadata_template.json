@@ -1,0 +1,93 @@
+[
+    {
+        "ClassName": "Process Activity",
+        "FirehoseName": "qopcfdr_process_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_process_activity_schema",
+        "CustomSourceName": "qfdr_processactivit",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Network Activity",
+        "FirehoseName": "qopcfdr_network_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_network_activity_schema",
+        "CustomSourceName": "qfdr_networkactivit",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Device Config State",
+        "FirehoseName": "qopcfdr_device_config_state_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_device_config_state_schema",
+        "CustomSourceName": "qfdr_deviceconfigst",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "HTTP Activity",
+        "FirehoseName": "qopcfdr_http_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_http_activity_schema",
+        "CustomSourceName": "qfdr_httpactivity",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "File System Activity",
+        "FirehoseName": "qopcfdr_file_system_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_file_system_activity_schema",
+        "CustomSourceName": "qfdr_filesystemacti",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "DNS Activity",
+        "FirehoseName": "qopcfdr_dns_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_dns_activity_schema",
+        "CustomSourceName": "qfdr_dnsactivity",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Authentication",
+        "FirehoseName": "qopcfdr_authentication_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_authentication_schema",
+        "CustomSourceName": "qfdr_authentication",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "File Hosting Activity",
+        "FirehoseName": "qopcfdr_file_hosting_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_file_hosting_activity_schema",
+        "CustomSourceName": "qfdr_filehostingact",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Module Activity",
+        "FirehoseName": "qopcfdr_module_activity_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_module_activity_schema",
+        "CustomSourceName": "qfdr_moduleactivity",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Application Lifecycle",
+        "FirehoseName": "qopcfdr_application_lifecycle_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_application_lifecycle_schema",
+        "CustomSourceName": "qfdr_applicationlif",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Operating System Patch State",
+        "FirehoseName": "qopcfdr_operating_system_patch_state_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_operating_system_patch_state_schema",
+        "CustomSourceName": "qfdr_operatingsyste",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "Detection Finding",
+        "FirehoseName": "qopcfdr_detection_finding_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_detection_finding_schema",
+        "CustomSourceName": "qfdr_detectionfindi",
+        "CustomSourceS3Location": "replace_me"
+    },
+    {
+        "ClassName": "HTTP Activity",
+        "FirehoseName": "qopcfdr_extapi_stream",
+        "GlueTransformationTableName": "query_open_pipeline_for_fdr_external_api_schema",
+        "CustomSourceName": "qfdr_externalapi",
+        "CustomSourceS3Location": "replace_me"
+    }
+]
