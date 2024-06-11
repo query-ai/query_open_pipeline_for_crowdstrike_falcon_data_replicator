@@ -10,6 +10,21 @@ From that point forward is where QOPCFDR serves as an asset. Using Amazon Web Se
 
 As a community project we hope that current consumers of Crowdstrike FDR and/or the Amazon Security Lake find this solution beneficial. Additionally, given the wide breadth of FDR data that come from different operating systems, Crowdstrike licensing tiers, and capture operations - we only have a small snapshot (~120 events) of the nearly 1000 FDR events. We will accept pull requests to improve normalization, to expand mapped events, and share mappings.
 
+## Table of Contents
+
+- [Query Open Pipeline for Crowdstrike Falcon Data Replicator](#query-open-pipeline-for-crowdstrike-falcon-data-replicator)
+  - [Table of Contents](#table-of-contents)
+  - [Solution Architecture](#solution-architecture)
+  - [Prequisites \& Assumptions](#prequisites-assumptions)
+  - [Known Limitations](#known-limitations)
+  - [Deployment Steps](#deployment-steps)
+    - [Prepare the Security Lake Admin Account](#prepare-the-security-lake-admin-account)
+      - [Deploying the QOPCFDR SchemaTransformation CFN](#deploying-the-qopcfdr-schematransformation-cfn)
+    - [Prepare the the FDR Source Account](#prepare-the-the-fdr-source-account)
+  - [Running the Solution \& Cost Estimation](#running-the-solution-cost-estimation)
+  - [Providing new Mappings](#providing-new-mappings)
+  - [License](#license)
+
 ## Solution Architecture
 
 ![QOPCFDR Solution Architecture](./media/QOPCFDR_Architecture.jpg)
@@ -76,27 +91,77 @@ All services except for the Amazon Security Lake Custom Sources (and supporting 
 
 The following steps must take place in the AWS Account where Amazon Security Lake is deployed. For the best configuration, deploy this into the (Delgated) Administrator account in your primary or "home" Roll-Up Region where all other Security Lake data flows.
 
+#### Deploying the QOPCFDR SchemaTransformation CFN
+
 1. Deploy the [`QOPCFDR_SchemaTransformation_CFN.yaml`](./src/cfn_yaml/QOPCFDR_SchemaTransformation_CFN.yaml) CloudFormation stack. This Stack deploys Glue Tables used by Firehose to translate JSON OCSF to Parquet, deploys necessary IAM Roles, and applies LakeFormation permissions to the Roles.
+
+    Automating the deployment of this CloudFormation is outside the scope of this document. To manually deploy the template:
+
+    - Download `QOPCFDR_SchemaTransformation_CFN.yaml`
+    - Open the AWS Console -> CloudFormation -> Stacks -> Create Stack
+        - Choose an existing template
+        - Upload a template file
+        - Choose the `QOPCFDR_SchemaTransformation_CFN.yaml` file you downloaded previously and click `Next`
+
+    You will be prompted to input CloudFormation Stack Parameters:
+
+    - FdrSourceAccountId: The FDR Source Account ID.  This is the account that processes your CloudStrike logs
+    - FdrSourceExternalId: Enter a value to use for External ID.  This value is used by the FDR Source Account during role assumption.  [Read more about External ID's here](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html).
+    - You can input any value you like here or generate a value.  ex: using a [short unique ID (uuid) generator](https://shortunique.id/)
+    - GlueServiceRolePolicy: Do not change this value
+    - SecLakeDatabaseName and SecLakeS3BucketName.
+    - Via the Console - AWS Glue -> Databases or
+    - By using the CLI:
+
+        ```shell
+        aws glue get-databases
+        ```
+
+        This will retrieve all of the glue databases in your account.  You *probably* want the one prefixed `amazon_security_lake_glue_db_{your_region}`.
+
+        Example output: (your output may be a different region)
+
+        ```json
+        {
+            "DatabaseList": [
+                {
+                    "Name": "amazon_security_lake_glue_db_us_east_1",
+                    "LocationUri": "aws-security-data-lake-us-east-1-9kFE3mYt71Fg0AxQClO5jPmLtQLhgz",
+                    "CreateTime": "2023-07-12T06:50:00-05:00",
+                    "CreateTableDefaultPermissions": [],
+                    "CatalogId": "123456789012"
+                }
+            ]
+        }
+        ```
+
+        The value for `SecLakeDatabaseName` is `DatabaseList[0].Name`
+
+        The value for `SecLakeS3BucketName` is `DatabaseList[0].LocationUri`
+
+    - Click `Next`
+    - Set the tags, retention policy, etc per your organizations standard
+    - Deploy the stack!
 
 2. In the output of the Stack, copy all three of the ARNs for the Roles, as they will be needed in future steps as shown below. The immediate one that is needed is the Glue Crawler ARN. This has Lake Formation permissions and IAM permissions to crawl the FDR data written to the Security Lake S3 Bucket.
 
-![Step 2](./media/step2.png)
+    ![Step 2](./media/step2.png)
 
 3. Manually create Custom Sources using the Custom Source Name and Class Name detailed in [`qopcfdr_firehose_metadata.json`](./src/json/qopcfdr_firehose_metadata.json) as shown, and detailed, below. As of 7 JUNE 2024 you will need to manually create 13 Custom Sources.
 
-    - Data source name: from `CustomSourceName`.
-    - OCSF Event class: from `ClassName`. Note that `Operating System Patch State` appears as `Patch State` in Security Lake.
+    - Data source name: from `CustomSourceName`.  **Note** that some of the names are intentionally truncated to 20 otherwise the IAM role created is to long.
+    - OCSF Event class: from `ClassName`. **Note** that `Operating System Patch State` appears as `Patch State` in Security Lake.
     - AWS Account ID: Enter your current account, this will create a dedicated IAM Role that allows s3:PutObject permissions. QOPCFDR uses Firehose so you can safely ignore these. *DO NOT DELETE THEM* or you will break Custom Sources.
-    - External ID: Enter anything here.
+    - External ID: Enter anything here.  This is the external id used for the iam role created for this source.  It is not needed for the Query Open Pipeline.
     - Service Access: Select **Use an exisitng service role** and choose the Crawler Role deployed in Step 1. This will be named `query_open_pipeline_for_fdr_crawler_role`.
 
-![Step 3](./media/step3.png)
+    ![Step 3](./media/step3.png)
 
 4. Copy the the full S3 URI (including `s3://` and the trailing `/`) back into the JSON file as shown below. this file will be used by a script in the following steps that will create the Firehose Delivery Streams. This is also why we could not create the Firehose resources in the CloudFormation template.
 
-![Step 4](./media/step4.png)
+    ![Step 4](./media/step4.png)
 
-5. Run the `create_qopcfdr_firehoses.py` script, providing an argument of the Firehose Role name and optionally the location of the metadata JSON if it is not in your current working directory. This will create Firehose Delivery Streams that use the Glue tables and the IAM Role from the Stack deployed in Step 1.
+5. Run the `create_qopcfdr_firehoses.py` script, providing an argument of the Firehose Role name (this should be `FirehoseStreamRoleArnOutput` from the initial CFN deployment) and optionally the location of the metadata JSON if it is not in your current working directory. This will create Firehose Delivery Streams that use the Glue tables and the IAM Role from the Stack deployed in Step 1.
 
 - 5A: You will require the following IAM Permissions
 
@@ -139,8 +204,13 @@ You have completed setup in the Security Lake Account, now change to your Data C
 7. Upload [`QFDR_OCSF_Mapping.json`](./src/json/QFDR_OCSF_Mapping.json), [`mapped_qfdr_events_to_class.json`](./src/json/mapped_qfdr_events_to_class.json), [`qopcfdr_stream_loader.py`](./src/python/qopcfdr_stream_loader.py) (**ZIP THIS BEFORE UPLOADING!**) into another S3 bucket - or use the same Bucket. These are artifacts needed to create the streaming Lambda function and contain `base_event` normalizations and Crowdstrike FDR to OCSF Class mappings.
 
 ```bash
+# zip the qopcfdr_stream_loader.py file
+cd src/python
+zip ../../qopcfdr_stream_loader.zip qopcfdr_stream_loader.py
+```
+
+```bash
 ARTIFACT_BUCKET_NAME="my_bucket_name"
-zip qopcfdr_stream_loader.zip src/python/qopcfdr_stream_loader.py
 aws s3 cp src/json/QFDR_OCSF_Mapping.json s3://${ARTIFACT_BUCKET_NAME}/QFDR_OCSF_Mapping.json
 aws s3 cp src/json/mapped_qfdr_events_to_class.json s3://${ARTIFACT_BUCKET_NAME}/mapped_qfdr_events_to_class.json
 aws s3 cp qopcfdr_stream_loader.zip s3://${ARTIFACT_BUCKET_NAME}/opcfdr_stream_loader.zip
